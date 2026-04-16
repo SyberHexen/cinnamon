@@ -314,12 +314,15 @@ var VolumeAction = class extends BaseAction {
 
         const soundSettings = new Gio.Settings({ schema_id: "org.cinnamon.desktop.sound" });
 
-        if(soundSettings.get_boolean("allow-amplified-volume"))
+        if (soundSettings.get_boolean("allow-amplified-out-volume"))
             this.max_volume = mixer.get_vol_max_amplified();
         else
             this.max_volume = mixer.get_vol_max_norm();
 
         this.pct_step = Math.ceil(this.max_volume / 100);
+
+        this.last_time = 0;
+        this.poll_interval = CONTINUOUS_ACTION_POLL_INTERVAL;
     }
 
     _set_volume(up, percentage) {
