@@ -638,11 +638,15 @@ class Module:
     def onOverAmplificationChanged(self, settings=None, key=None):
         overamplification = self.sound_settings.get_boolean(OVERAMPLIFICATION_KEY)
         self.outVolume.slider.clear_marks()
+        self.inVolume.slider.clear_marks()
         if overamplification:
             self.outVolume.adjustment.set_upper(150)
+            self.inVolume.adjustment.set_upper(150)
             self.outVolume.setMark(100)
+            self.inVolume.setMark(100)
         else:
             self.outVolume.adjustment.set_upper(100)
+            self.inVolume.adjustment.set_upper(100)
 
     def inializeController(self):
         self.controller = Cvc.MixerControl(name = "cinnamon")
