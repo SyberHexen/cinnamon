@@ -385,7 +385,12 @@ var CinnamonDBus = class {
 
         let rect = global.workspace_manager.get_active_workspace().get_work_area_for_monitor(index);
 
-        return [rect.x, rect.y, rect.width, rect.height];
+        /* Callers (nemo's desktop) are X11 clients and take this in X screen
+         * pixels.  On Wayland with fractional or mixed monitor scales,
+         * Xwayland's screen is the layout scaled up, so scale it too. */
+        let scale = global.display.get_xwayland_scale ? global.display.get_xwayland_scale() : 1;
+
+        return [rect.x * scale, rect.y * scale, rect.width * scale, rect.height * scale];
     }
 
     GetRunState() {
