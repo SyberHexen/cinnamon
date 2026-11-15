@@ -61,6 +61,8 @@ class PopupDialog extends BaseDialog.BaseDialog {
     }
 
     _teardownOpenState() {
+        this._centerMonitor = null;
+
         if (this._dragCaptureId)
             this._endDrag();
 
@@ -139,12 +141,30 @@ class PopupDialog extends BaseDialog.BaseDialog {
             monitor = Main.layoutManager.primaryMonitor;
         }
 
+        /* The contents are not sized yet when the dialog opens, so keep it
+         * centered as its size settles, until the user drags it. */
+        this._centerMonitor = monitor;
+        if (!this._recenterId)
+            this._recenterId = this.connect('notify::allocation', () => {
+                if (this._centerMonitor)
+                    this._applyCenter();
+            });
+
         this.opacity = 0;
         this.show();
 
-        let x = monitor.x + (monitor.width - this.width) / 2;
-        let y = monitor.y + (monitor.height - this.height) / 2;
-        this.set_position(x, y);
+        this._applyCenter();
+    }
+
+    _applyCenter() {
+        let monitor = this._centerMonitor;
+        let [, natWidth] = this.get_preferred_width(-1);
+        let [, natHeight] = this.get_preferred_height(natWidth);
+
+        let x = monitor.x + (monitor.width - natWidth) / 2;
+        let y = monitor.y + (monitor.height - natHeight) / 2;
+        if (x !== this.x || y !== this.y)
+            this.set_position(x, y);
     }
 
     _focusStage() {
@@ -224,6 +244,7 @@ class PopupDialog extends BaseDialog.BaseDialog {
     }
 
     _startDrag(event) {
+        this._centerMonitor = null;
         this._dragGrabbed = global.begin_modal(global.get_current_time(), 0);
         if (!this._dragGrabbed) {
             global.logWarning('PopupDialog: begin_modal failed; drag aborted');
