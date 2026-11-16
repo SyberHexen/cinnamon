@@ -292,6 +292,10 @@ function do_shutdown_sequence() {
 
 function onSessionOver() {
     global.log("Session is ending");
+    // Keep the desktop on screen through the session closing down (the
+    // wallpaper and windows going away) for the login screen to take over.
+    if (Meta.hold_screen_for_display)
+        Meta.hold_screen_for_display(global.display);
     soundManager.disable();
     backgroundManager.disableRestart();
 }
@@ -456,6 +460,62 @@ function start() {
     // restart the wallpaper daemon is already up, so there's nothing to wait for.)
     let first_login = !global.session_running;
 
+    // Muffin keeps what was on screen before it (the login screen) up until
+    // we have something to show: the desktop, once revealed and with the
+    // wallpaper in a painted frame. The daemon reports ready once it has drawn
+    // its frame, which can be before Muffin has it on every monitor, and its
+    // buffers can still be being drawn by the GPU when they arrive (shown
+    // early, they come out black): wait until the wallpaper has been on every
+    // monitor for a moment.
+    const WALLPAPER_SETTLE_MS = 100;
+    let showScreen = () => {
+        if (!Meta.release_held_screen_for_display)
+            return;
+
+        let shown = false;
+        let framesWithWallpaper = 0;
+        let wallpaperSince = 0;
+        let paintId = 0;
+        let timeoutId = 0;
+        let show = () => {
+            if (shown)
+                return;
+            shown = true;
+            global.stage.disconnect(paintId);
+            if (timeoutId)
+                GLib.source_remove(timeoutId);
+            Meta.release_held_screen_for_display(global.display);
+        };
+        // The wallpaper's surfaces: one per monitor once mapped
+        let wallpaperMapped = () => {
+            let actors = global.get_background_actors();
+            return actors.length >= global.display.get_n_monitors() &&
+                   actors.every(actor => actor.visible && actor.width > 0);
+        };
+
+        paintId = global.stage.connect('after-paint', () => {
+            if (shown)
+                return;
+            if (wallpaperMapped()) {
+                if (framesWithWallpaper++ == 0)
+                    wallpaperSince = GLib.get_monotonic_time();
+            } else {
+                framesWithWallpaper = 0;
+            }
+            if (framesWithWallpaper >= 2 &&
+                GLib.get_monotonic_time() - wallpaperSince >= WALLPAPER_SETTLE_MS * 1000)
+                show();
+            else
+                global.stage.queue_redraw();
+        });
+        timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 600, () => {
+            timeoutId = 0;
+            show();
+            return GLib.SOURCE_REMOVE;
+        });
+        global.stage.queue_redraw();
+    };
+
     // Comes down exactly once, from whichever path gets there first --
     // _startupAnimationComplete() is not safe to run twice.
     let revealed = false;
@@ -464,6 +524,7 @@ function start() {
             return;
         revealed = true;
         layoutManager._doStartupAnimation(animate);
+        showScreen();
     };
 
     if (first_login) {
@@ -665,6 +726,7 @@ function start() {
         } else {
             backgroundManager.showBackground();
             setRunState(RunState.RUNNING);
+            showScreen();
         }
 
         // Disable panel edit mode when Cinnamon starts
