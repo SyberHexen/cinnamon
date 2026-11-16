@@ -89,6 +89,11 @@ struct _CinnamonBackgroundDaemon
     guint        redraw_id;
     gboolean     monitors_dirty;
 
+    /* The configured picture, decoded on a thread from startup on so the
+       decode runs alongside the window and GL setup of the first draw */
+    GThread     *prefetch_thread;
+    char        *prefetch_uri;
+
     /* transition preference */
     GSettings   *muffin_settings;
     BgTransition transition;
@@ -155,6 +160,69 @@ file_mtime (const char *path)
     return (gint64) g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
 }
 
+typedef struct {
+    char      *path;
+    GdkPixbuf *pixbuf;      /* NULL if it failed */
+    gint64     mtime;
+} PrefetchResult;
+
+static gpointer
+prefetch_thread_func (gpointer data)
+{
+    PrefetchResult *result = data;
+    g_autoptr(GdkPixbuf) stored = gdk_pixbuf_new_from_file (result->path, NULL);
+
+    result->mtime = file_mtime (result->path);
+    if (stored)
+        result->pixbuf = gdk_pixbuf_apply_embedded_orientation (stored);
+
+    return result;
+}
+
+/* Start decoding the configured picture, at startup: it is the slowest part
+ * of the first draw and needs neither the windows nor the monitor layout */
+static void
+start_prefetch (CinnamonBackgroundDaemon *daemon)
+{
+    g_autoptr(GSettings) settings = g_settings_new ("org.cinnamon.desktop.background");
+    g_autofree char *uri = g_settings_get_string (settings, "picture-uri");
+    g_autofree char *path = uri && uri[0] ? g_filename_from_uri (uri, NULL, NULL) : NULL;
+
+    if (!path)
+        return;
+
+    PrefetchResult *result = g_new0 (PrefetchResult, 1);
+    result->path = g_steal_pointer (&path);
+
+    daemon->prefetch_uri = g_steal_pointer (&uri);
+    daemon->prefetch_thread = g_thread_new ("bg-prefetch", prefetch_thread_func, result);
+}
+
+/* The prefetched picture into the cache (waiting for it if still decoding) */
+static void
+finish_prefetch (CinnamonBackgroundDaemon *daemon)
+{
+    if (!daemon->prefetch_thread)
+        return;
+
+    PrefetchResult *result = g_thread_join (g_steal_pointer (&daemon->prefetch_thread));
+    g_autofree char *uri = g_steal_pointer (&daemon->prefetch_uri);
+
+    if (result->pixbuf) {
+        g_debug ("    Prefetched background image %s (%dx%d)", result->path,
+                 gdk_pixbuf_get_width (result->pixbuf),
+                 gdk_pixbuf_get_height (result->pixbuf));
+
+        CachedImage *ci = g_new0 (CachedImage, 1);
+        ci->pixbuf = result->pixbuf;
+        ci->mtime = result->mtime;
+        g_hash_table_insert (daemon->pixbuf_cache, g_steal_pointer (&uri), ci);
+    }
+
+    g_free (result->path);
+    g_free (result);
+}
+
 /* Load (or return cached) pixbuf for a uri, refreshing on mtime change. The
  * cache is keyed by uri so monitors sharing an image only load it once. */
 static GdkPixbuf *
@@ -162,6 +230,9 @@ get_pixbuf_for_uri (CinnamonBackgroundDaemon *daemon, const char *uri)
 {
     if (!uri || uri[0] == '\0')
         return NULL;
+
+    if (daemon->prefetch_uri && g_strcmp0 (uri, daemon->prefetch_uri) == 0)
+        finish_prefetch (daemon);
 
     g_autoptr(GError) uri_err = NULL;
     g_autofree char *path = g_filename_from_uri (uri, NULL, &uri_err);
@@ -632,7 +703,15 @@ redraw_cb (gpointer data)
 static void
 queue_draw_background (CinnamonBackgroundDaemon *daemon)
 {
-    if (daemon->redraw_id == 0)
+    if (daemon->redraw_id != 0)
+        return;
+
+    /* Until the first picture is up the session waits for it (Cinnamon holds
+       the desktop back): the monitor layout arriving at startup is one event,
+       not a hotplug burst, so draw as soon as the main loop is idle */
+    if (!daemon->ready)
+        daemon->redraw_id = g_idle_add (redraw_cb, daemon);
+    else
         daemon->redraw_id = g_timeout_add (REDRAW_COALESCE_MS, redraw_cb, daemon);
 }
 
@@ -766,6 +845,7 @@ teardown (CinnamonBackgroundDaemon *daemon)
 
     g_clear_handle_id (&daemon->redraw_id, g_source_remove);
     g_clear_handle_id (&daemon->malloc_trim_id, g_source_remove);
+    finish_prefetch (daemon);
     clear_pixbuf_cache (daemon);
 #ifdef BG_WITH_WAYLAND
     g_clear_pointer (&daemon->wayland, bg_wayland_backend_free);
@@ -841,6 +921,8 @@ cinnamon_background_daemon_startup (GApplication *app)
     G_APPLICATION_CLASS (cinnamon_background_daemon_parent_class)->startup (app);
 
     g_debug ("Starting background daemon");
+
+    start_prefetch (daemon);
 
 #ifdef BG_WITH_WAYLAND
     if (GDK_IS_WAYLAND_DISPLAY (gdk_display_get_default ()))
