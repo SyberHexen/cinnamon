@@ -468,9 +468,12 @@ function start() {
     // early, they come out black): wait until the wallpaper has been on every
     // monitor for a moment.
     const WALLPAPER_SETTLE_MS = 100;
-    let showScreen = () => {
-        if (!Meta.release_held_screen_for_display)
+    let showScreen = (onShown) => {
+        if (!Meta.release_held_screen_for_display) {
+            if (onShown)
+                onShown();
             return;
+        }
 
         let shown = false;
         let framesWithWallpaper = 0;
@@ -485,6 +488,8 @@ function start() {
             if (timeoutId)
                 GLib.source_remove(timeoutId);
             Meta.release_held_screen_for_display(global.display);
+            if (onShown)
+                onShown();
         };
         // The wallpaper's surfaces: one per monitor once mapped
         let wallpaperMapped = () => {
@@ -523,8 +528,15 @@ function start() {
         if (revealed)
             return;
         revealed = true;
-        layoutManager._doStartupAnimation(animate);
-        showScreen();
+        if (animate) {
+            // Fade the cover away once the screen shows, so that the fade is
+            // seen from its start rather than from wherever it had got to
+            // while Muffin held the screen
+            showScreen(() => layoutManager._doStartupAnimation(true));
+        } else {
+            layoutManager._doStartupAnimation(false);
+            showScreen();
+        }
     };
 
     if (first_login) {
