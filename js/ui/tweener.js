@@ -383,6 +383,7 @@ ClutterFrameTicker.prototype = {
         // when we need to stop, so use 1000 seconds as "infinity"
         this._timeline = new Clutter.Timeline({ duration: 1000*1000 });
         this._startTime = -1;
+        this._actor = null;
 
         this._timeline.connect('new-frame', Lang.bind(this,
             function(timeline, frame) {
@@ -398,7 +399,35 @@ ClutterFrameTicker.prototype = {
                               "");
     },
 
+    // When all running tweens animate one actor, tick with the monitors that
+    // actor is on (Clutter otherwise ticks with the fastest monitor)
+    _syncActor : function() {
+        if (!this._timeline.set_actor)
+            return;
+
+        let tweens = Tweener._tweenList;
+        let actor = null;
+
+        for (let i = 0; tweens && i < tweens.length; i++) {
+            let scope = tweens[i].scope;
+
+            if (!(scope instanceof Clutter.Actor) ||
+                (actor && actor !== scope)) {
+                actor = null;
+                break;
+            }
+            actor = scope;
+        }
+
+        if (actor !== this._actor) {
+            this._actor = actor;
+            this._timeline.set_actor(actor);
+        }
+    },
+
     _onNewFrame : function(frame) {
+        this._syncActor();
+
         // If there is a lot of setup to start the animation, then
         // first frame number we get from clutter might be a long ways
         // into the animation (or the animation might even be done).
@@ -428,6 +457,10 @@ ClutterFrameTicker.prototype = {
 
     stop : function() {
         this._timeline.stop();
+        if (this._actor) {
+            this._actor = null;
+            this._timeline.set_actor(null);
+        }
         this._startTime = -1;
         global.end_work();
     }
