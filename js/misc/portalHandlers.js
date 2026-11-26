@@ -5,6 +5,9 @@ const GLib = imports.gi.GLib;
 const Cinnamon = imports.gi.Cinnamon;
 const Meta = imports.gi.Meta;
 
+/* The desktop portal backend, the only caller allowed to grab shortcuts */
+const PORTAL_BUS_NAME = 'org.freedesktop.impl.portal.desktop.xapp';
+
 const XdgAppState = {
     BACKGROUND: 0, // window.is_hidden
     RUNNING: 1, // window visible
@@ -40,6 +43,19 @@ const CinnamonPortalIface =
                 <arg type="i" direction="out" name="stride" /> \
                 <arg type="ay" direction="out" name="pixels" /> \
             </method> \
+            <method name="GrabShortcuts"> \
+                <arg type="s" direction="in" name="owner" /> \
+                <arg type="a(ss)" direction="in" name="shortcuts" /> \
+                <arg type="as" direction="out" name="failed" /> \
+            </method> \
+            <method name="UngrabShortcuts"> \
+                <arg type="s" direction="in" name="owner" /> \
+            </method> \
+            <signal name="ShortcutActivated"> \
+                <arg type="s" name="owner" /> \
+                <arg type="s" name="shortcut_id" /> \
+                <arg type="u" name="timestamp" /> \
+            </signal> \
         </interface> \
     </node>';
 
@@ -61,6 +77,22 @@ var CinnamonPortalHandler = class CinnamonPortalHandler {
         });
         for (let actor of global.get_window_actors())
             this._watchWindow(actor.meta_window);
+
+        /* org.freedesktop.impl.portal.GlobalShortcuts: the keybindings the
+         * portal grabbed, by owner (the portal's session) */
+        this._shortcutGrabs = new Map();
+        this._nextShortcutGrab = 0;
+        this._portalOwner = null;
+        Gio.bus_watch_name_on_connection(Gio.DBus.session, PORTAL_BUS_NAME,
+                                         Gio.BusNameWatcherFlags.NONE,
+                                         (connection, name, owner) => {
+                                             this._ungrabAllShortcuts();
+                                             this._portalOwner = owner;
+                                         },
+                                         () => {
+                                             this._ungrabAllShortcuts();
+                                             this._portalOwner = null;
+                                         });
     }
 
     _watchWindow(window) {
@@ -190,5 +222,74 @@ var CinnamonPortalHandler = class CinnamonPortalHandler {
             global.display.get_monitor_thumbnail(index, maxWidth, maxHeight) : null;
 
         invocation.return_value(this._thumbnailVariant(result));
+    }
+
+    /* Shortcuts are global key grabs, so only the portal backend may make
+     * them; it asks the user before it grabs anything for an application. */
+    _isFromPortal(invocation) {
+        if (this._portalOwner && invocation.get_sender() === this._portalOwner)
+            return true;
+
+        invocation.return_error_literal(Gio.DBusError, Gio.DBusError.ACCESS_DENIED,
+                                        'Only the desktop portal can grab shortcuts');
+        return false;
+    }
+
+    _ungrabShortcuts(owner) {
+        const names = this._shortcutGrabs.get(owner);
+
+        if (!names)
+            return;
+
+        const keybindingManager = imports.ui.main.keybindingManager;
+        for (let name of names)
+            keybindingManager.removeHotKey(name);
+        this._shortcutGrabs.delete(owner);
+    }
+
+    _ungrabAllShortcuts() {
+        for (let owner of [...this._shortcutGrabs.keys()])
+            this._ungrabShortcuts(owner);
+    }
+
+    /* Grabs the (shortcut id, accelerator) pairs for an owner, in place of
+     * what it grabbed before; returns the ids that couldn't be grabbed (the
+     * accelerator is invalid or already taken) */
+    GrabShortcutsAsync(params, invocation) {
+        if (!this._isFromPortal(invocation))
+            return;
+
+        const [owner, shortcuts] = params;
+        const keybindingManager = imports.ui.main.keybindingManager;
+        const names = [];
+        const failed = [];
+
+        this._ungrabShortcuts(owner);
+
+        for (let [id, accelerator] of shortcuts) {
+            const name = 'portal-shortcut-' + this._nextShortcutGrab++;
+            /* The time of the key press being handled */
+            const callback = () => {
+                this._dbusImpl.emit_signal('ShortcutActivated',
+                                           new GLib.Variant('(ssu)', [owner, id, global.get_current_time()]));
+            };
+
+            if (accelerator && keybindingManager.addHotKeyArray(name, [accelerator], callback))
+                names.push(name);
+            else
+                failed.push(id);
+        }
+
+        this._shortcutGrabs.set(owner, names);
+        invocation.return_value(new GLib.Variant('(as)', [failed]));
+    }
+
+    UngrabShortcutsAsync(params, invocation) {
+        if (!this._isFromPortal(invocation))
+            return;
+
+        const [owner] = params;
+        this._ungrabShortcuts(owner);
+        invocation.return_value(null);
     }
 }
