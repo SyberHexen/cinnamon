@@ -150,58 +150,86 @@ function stableKey(owner) {
     return owner.stable;
 }
 
-/* Who an icon belongs to, from its name: StatusNotifierItem ids carry the
- * process id ("org.freedesktop.statusnotifieritem-<pid>-<n>", Chromium and
- * Electron), a unique bus name gives it through the bus, anything else is
- * an application name matched against the windows' class and app id. */
-function iconOwner(name) {
+/* The process id behind a bus name: StatusNotifierItem names carry it
+ * ("org.freedesktop.StatusNotifierItem-<pid>-<n>", "org.kde.…"), otherwise
+ * the bus knows it. 0 if not known. */
+function busPid(busName) {
+    let m = busName.match(/statusnotifieritem-(\d+)-\d+$/i);
+    if (m) {
+        return parseInt(m[1]);
+    }
+
+    let pid = busPids.get(busName);
+    if (pid === undefined) {
+        pid = 0;
+        try {
+            let reply = Gio.DBus.session.call_sync("org.freedesktop.DBus",
+                                                   "/org/freedesktop/DBus",
+                                                   "org.freedesktop.DBus",
+                                                   "GetConnectionUnixProcessID",
+                                                   new GLib.Variant("(s)", [busName]),
+                                                   null, Gio.DBusCallFlags.NONE, 500, null);
+            pid = reply.deep_unpack()[0];
+        } catch (e) {
+        }
+        busPids.set(busName, pid);
+    }
+
+    return pid;
+}
+
+/* Who an icon belongs to: the process behind it, from the bus name of the
+ * StatusNotifierItem it comes from (xapp-sn-watcher puts it in the icon's
+ * metadata) or from its name when that carries one, and its name, an
+ * application name matched against the windows' class and app id when the
+ * process has no windows (a tray helper process) or isn't known. */
+function iconOwner(name, busName) {
     name = name || "";
 
-    let m = name.match(/statusnotifieritem-(\d+)-\d+$/);
-    if (m) {
-        return { pid: parseInt(m[1]), key: "pid:" + m[1] };
+    let pid = 0;
+    if (busName) {
+        pid = busPid(busName);
+    }
+    if (!pid && (name.match(/statusnotifieritem-\d+-\d+$/i) || name.startsWith(":"))) {
+        pid = busPid(name);
     }
 
-    if (name.startsWith(":")) {
-        let pid = busPids.get(name);
-
-        if (pid === undefined) {
-            pid = 0;
-            try {
-                let reply = Gio.DBus.session.call_sync("org.freedesktop.DBus",
-                                                       "/org/freedesktop/DBus",
-                                                       "org.freedesktop.DBus",
-                                                       "GetConnectionUnixProcessID",
-                                                       new GLib.Variant("(s)", [name]),
-                                                       null, Gio.DBusCallFlags.NONE, 500, null);
-                pid = reply.deep_unpack()[0];
-            } catch (e) {
-            }
-            busPids.set(name, pid);
-        }
-
-        if (pid) {
-            return { pid: pid, key: "pid:" + pid };
-        }
+    if (pid) {
+        return { pid: pid, key: "pid:" + pid, name: name.toLowerCase() };
     }
 
-    return { pid: 0, key: name.toLowerCase() };
+    return { pid: 0, key: name.toLowerCase(), name: name.toLowerCase() };
+}
+
+/* The bus name of the StatusNotifierItem an icon comes from, if any */
+function iconBusName(proxy) {
+    try {
+        let metadata = JSON.parse(proxy.metadata || "{}");
+        if (typeof metadata["sn-bus-name"] == "string") {
+            return metadata["sn-bus-name"];
+        }
+    } catch (e) {
+    }
+    return null;
 }
 
 function ownerWindows(owner) {
     let tracker = Cinnamon.WindowTracker.get_default();
 
-    return global.display.list_windows(0).filter(w => {
+    let windows = global.display.list_windows(0).filter(w => {
         let type = w.get_window_type();
-        if (type != Meta.WindowType.NORMAL && type != Meta.WindowType.DIALOG) {
-            return false;
-        }
+        return type == Meta.WindowType.NORMAL || type == Meta.WindowType.DIALOG;
+    });
 
-        if (owner.pid) {
-            return w.get_pid() == owner.pid;
+    if (owner.pid) {
+        let own = windows.filter(w => w.get_pid() == owner.pid);
+        if (own.length > 0) {
+            return own;
         }
+    }
 
-        let key = owner.key;
+    let key = owner.name;
+    return windows.filter(w => {
         let wmClass = (w.get_wm_class() || "").toLowerCase();
         let wmInstance = (w.get_wm_class_instance() || "").toLowerCase();
         let app = tracker.get_window_app(w);
@@ -231,6 +259,10 @@ function ownerMonitor(owner) {
     }
 
     let saved = lastMonitors.get(stableKey(owner));
+    if (saved === undefined && owner.name) {
+        /* Remembered by the icon's name (before its program was known) */
+        saved = lastMonitors.get(owner.name);
+    }
     if (typeof saved == "number") {
         return saved;
     }
@@ -542,10 +574,12 @@ class XAppStatusIcon {
     /* The application the icon belongs to; its name can come after the icon */
     get owner() {
         let name = this.proxy.name || "";
+        let busName = iconBusName(this.proxy);
 
-        if (this._ownerName !== name) {
+        if (this._ownerName !== name || this._ownerBusName !== busName) {
             this._ownerName = name;
-            this._owner = iconOwner(name);
+            this._ownerBusName = busName;
+            this._owner = iconOwner(name, busName);
         }
 
         return this._owner;
