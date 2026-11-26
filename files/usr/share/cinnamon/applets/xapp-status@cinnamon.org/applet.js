@@ -3,6 +3,7 @@ const Lang = imports.lang;
 const St = imports.gi.St;
 const Gio = imports.gi.Gio;
 const Clutter = imports.gi.Clutter;
+const Meta = imports.gi.Meta;
 const Interfaces = imports.misc.interfaces;
 const Applet = imports.ui.applet;
 const Main = imports.ui.main;
@@ -15,6 +16,230 @@ const Tooltips = imports.ui.tooltips;
 
 const HORIZONTAL_STYLE = 'padding-left: 2px; padding-right: 2px; padding-top: 0; padding-bottom: 0';
 const VERTICAL_STYLE = 'padding-left: 0; padding-right: 0; padding-top: 2px; padding-bottom: 2px';
+
+/* Icons on the monitor of their application. With this applet on panels on
+ * several monitors, an icon shows on the panel of the monitor its
+ * application's windows are on, or were on last when the application is
+ * closed to the tray. An icon with no known monitor, or whose monitor has no
+ * such panel, shows on the primary monitor's panel. With all the applets on
+ * one monitor, every applet shows every icon, as before. */
+const busPids = new Map();        // unique bus name -> process id
+
+/* application -> monitor, kept across sessions, so an application that
+ * starts in the tray (no window yet) goes where it was last time. A monitor
+ * is kept as its EDID identity, as Muffin's monitor configuration does
+ * (vendor/product/serial, plus the connector when there's no serial), so
+ * it's the same screen whatever port or order it's in. Entries saved as a
+ * monitor index (older versions) are taken as that index and converted. */
+const MONITORS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), "cinnamon", "xapp-status-monitors.json"]);
+const lastMonitors = new Map();
+let saveMonitorsId = 0;
+
+try {
+    let [ok, contents] = GLib.file_get_contents(MONITORS_FILE);
+    if (ok) {
+        let saved = JSON.parse(new TextDecoder().decode(contents));
+        for (let key in saved) {
+            lastMonitors.set(key, saved[key]);
+        }
+    }
+} catch (e) {
+}
+
+/* Monitor index <-> identity, from DisplayConfig (asynchronously: it's served
+ * by this process) */
+const monitorIds = new Map();     // index -> identity
+const monitorIndices = new Map(); // identity -> index
+const trayApplets = new Set();
+let monitorIdsSerial = 0;
+
+function refreshMonitorIds() {
+    let serial = ++monitorIdsSerial;
+
+    Gio.DBus.session.call("org.cinnamon.Muffin.DisplayConfig", "/org/cinnamon/Muffin/DisplayConfig",
+                          "org.cinnamon.Muffin.DisplayConfig", "GetCurrentState",
+                          null, null, Gio.DBusCallFlags.NONE, 5000, null, (connection, result) => {
+        if (serial != monitorIdsSerial) {
+            return;
+        }
+
+        try {
+            let monitors = connection.call_finish(result).deep_unpack()[1];
+            let manager = Meta.MonitorManager.get();
+
+            monitorIds.clear();
+            monitorIndices.clear();
+            for (let monitor of monitors) {
+                let spec = monitor[0].deep_unpack ? monitor[0].deep_unpack() : monitor[0];
+                let [connector, vendor, product, monitorSerial] = spec;
+                let index = manager.get_monitor_for_connector(connector);
+                if (index < 0) {
+                    continue;
+                }
+
+                let id = vendor + "/" + product + "/" + monitorSerial;
+                if (!monitorSerial || /^(0x)?0*$/.test(monitorSerial)) {
+                    id += "@" + connector;
+                }
+                monitorIds.set(index, id);
+                monitorIndices.set(id, index);
+            }
+
+            /* Convert entries saved as an index */
+            let converted = false;
+            for (let [key, value] of lastMonitors) {
+                if (typeof value == "number" && monitorIds.has(value)) {
+                    lastMonitors.set(key, monitorIds.get(value));
+                    converted = true;
+                }
+            }
+            if (converted) {
+                saveMonitors();
+            }
+        } catch (e) {
+            global.logError(e);
+        }
+
+        for (let applet of trayApplets) {
+            applet.queueIconMonitorsUpdate();
+        }
+    });
+}
+
+function saveMonitors() {
+    if (saveMonitorsId > 0) {
+        return;
+    }
+
+    saveMonitorsId = Mainloop.timeout_add_seconds(2, () => {
+        saveMonitorsId = 0;
+        try {
+            GLib.file_set_contents(MONITORS_FILE, JSON.stringify(Object.fromEntries(lastMonitors)));
+        } catch (e) {
+            global.logError(e);
+        }
+        return GLib.SOURCE_REMOVE;
+    });
+}
+
+/* A key for the application that stays the same between runs (process ids
+ * change with each start): its program's name, and its first argument that
+ * isn't an option (an Electron application's resources) */
+function stableKey(owner) {
+    if (!owner.pid) {
+        return owner.key;
+    }
+
+    if (owner.stable === undefined) {
+        owner.stable = owner.key;
+        try {
+            let [ok, contents] = GLib.file_get_contents("/proc/" + owner.pid + "/cmdline");
+            let args = new TextDecoder().decode(contents).split("\0").filter(arg => arg.length > 0);
+            /* Chromium-based programs rewrite their command line as one string */
+            if (args.length == 1) {
+                args = args[0].split(" ").filter(arg => arg.length > 0);
+            }
+            if (args.length > 0) {
+                let first = args.slice(1).find(arg => !arg.startsWith("-"));
+                owner.stable = "exe:" + GLib.path_get_basename(args[0]) + (first ? " " + first : "");
+            }
+        } catch (e) {
+        }
+    }
+
+    return owner.stable;
+}
+
+/* Who an icon belongs to, from its name: StatusNotifierItem ids carry the
+ * process id ("org.freedesktop.statusnotifieritem-<pid>-<n>", Chromium and
+ * Electron), a unique bus name gives it through the bus, anything else is
+ * an application name matched against the windows' class and app id. */
+function iconOwner(name) {
+    name = name || "";
+
+    let m = name.match(/statusnotifieritem-(\d+)-\d+$/);
+    if (m) {
+        return { pid: parseInt(m[1]), key: "pid:" + m[1] };
+    }
+
+    if (name.startsWith(":")) {
+        let pid = busPids.get(name);
+
+        if (pid === undefined) {
+            pid = 0;
+            try {
+                let reply = Gio.DBus.session.call_sync("org.freedesktop.DBus",
+                                                       "/org/freedesktop/DBus",
+                                                       "org.freedesktop.DBus",
+                                                       "GetConnectionUnixProcessID",
+                                                       new GLib.Variant("(s)", [name]),
+                                                       null, Gio.DBusCallFlags.NONE, 500, null);
+                pid = reply.deep_unpack()[0];
+            } catch (e) {
+            }
+            busPids.set(name, pid);
+        }
+
+        if (pid) {
+            return { pid: pid, key: "pid:" + pid };
+        }
+    }
+
+    return { pid: 0, key: name.toLowerCase() };
+}
+
+function ownerWindows(owner) {
+    let tracker = Cinnamon.WindowTracker.get_default();
+
+    return global.display.list_windows(0).filter(w => {
+        let type = w.get_window_type();
+        if (type != Meta.WindowType.NORMAL && type != Meta.WindowType.DIALOG) {
+            return false;
+        }
+
+        if (owner.pid) {
+            return w.get_pid() == owner.pid;
+        }
+
+        let key = owner.key;
+        let wmClass = (w.get_wm_class() || "").toLowerCase();
+        let wmInstance = (w.get_wm_class_instance() || "").toLowerCase();
+        let app = tracker.get_window_app(w);
+        let appId = app ? app.get_id().toLowerCase().replace(/\.desktop$/, "") : "";
+
+        return key && (wmClass == key || wmInstance == key || appId == key || appId.endsWith("." + key));
+    });
+}
+
+/* The monitor an icon belongs on, or -1 if not known */
+function ownerMonitor(owner) {
+    let windows = ownerWindows(owner);
+
+    if (windows.length > 0) {
+        let latest = windows.reduce((a, b) => (b.get_user_time() > a.get_user_time() ? b : a));
+        let monitor = latest.get_monitor();
+
+        if (monitor >= 0) {
+            let key = stableKey(owner);
+            let id = monitorIds.get(monitor);
+            if (id !== undefined && lastMonitors.get(key) !== id) {
+                lastMonitors.set(key, id);
+                saveMonitors();
+            }
+            return monitor;
+        }
+    }
+
+    let saved = lastMonitors.get(stableKey(owner));
+    if (typeof saved == "number") {
+        return saved;
+    }
+    if (saved !== undefined && monitorIndices.has(saved)) {
+        return monitorIndices.get(saved);
+    }
+    /* Not known, or that monitor isn't connected */
+    return -1;
+}
 
 
 class RecorderIcon {
@@ -108,6 +333,7 @@ class XAppStatusIcon {
         this.name = proxy.get_name();
         this.applet = applet;
         this.proxy = proxy;
+        this._wantVisible = true;
 
         this.iconName = null;
         this.icon_loader_handle = null;
@@ -309,7 +535,33 @@ class XAppStatusIcon {
     }
 
     setVisible(visible) {
-        if (visible) {
+        this._wantVisible = visible;
+        this.updateVisible();
+    }
+
+    /* The application the icon belongs to; its name can come after the icon */
+    get owner() {
+        let name = this.proxy.name || "";
+
+        if (this._ownerName !== name) {
+            this._ownerName = name;
+            this._owner = iconOwner(name);
+        }
+
+        return this._owner;
+    }
+
+    updateVisible() {
+        let here = true;
+
+        try {
+            here = this.applet.iconIsHere(this);
+        } catch (e) {
+            /* Never lose an icon over this */
+            global.logError(e);
+        }
+
+        if (this._wantVisible && here) {
             this.actor.show();
         }
         else {
@@ -469,6 +721,53 @@ class CinnamonXAppStatusApplet extends Applet.Applet {
          * types, listen to the panel signal directly, so we always receive the update. */
         this.signalManager.connect(this.panel, "icon-size-changed", this.icon_size_changed, this);
         this.signalManager.connect(global, "scale-changed", this.ui_scale_changed, this);
+
+        this._monitorsUpdateId = 0;
+        this.signalManager.connect(global.display, "window-created", this.queueIconMonitorsUpdate, this);
+        this.signalManager.connect(global.display, "window-entered-monitor", this.queueIconMonitorsUpdate, this);
+        this.signalManager.connect(global.display, "window-left-monitor", this.queueIconMonitorsUpdate, this);
+        this.signalManager.connect(Main.layoutManager, "monitors-changed", refreshMonitorIds);
+
+        trayApplets.add(this);
+        refreshMonitorIds();
+    }
+
+    /* Whether an icon shows on this applet (see lastMonitors) */
+    iconIsHere(icon) {
+        let instances = Main.AppletManager.getRunningInstancesForUuid(this._uuid);
+        let monitors = instances.map(applet => applet.panel.monitorIndex);
+
+        if (monitors.every(monitor => monitor == monitors[0])) {
+            return true;
+        }
+
+        let monitor = ownerMonitor(icon.owner);
+        if (!monitors.includes(monitor)) {
+            let primary = Main.layoutManager.primaryIndex;
+            monitor = monitors.includes(primary) ? primary : monitors[0];
+        }
+
+        return this.panel.monitorIndex == monitor;
+    }
+
+    queueIconMonitorsUpdate() {
+        if (this._monitorsUpdateId > 0) {
+            return;
+        }
+
+        this._monitorsUpdateId = Mainloop.idle_add(() => {
+            this._monitorsUpdateId = 0;
+
+            for (let key in this.statusIcons) {
+                this.statusIcons[key].updateVisible();
+            }
+
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    on_applet_instances_changed() {
+        this.queueIconMonitorsUpdate();
     }
 
     getKey(icon_proxy) {
@@ -656,6 +955,13 @@ class CinnamonXAppStatusApplet extends Applet.Applet {
             Mainloop.source_remove(this._scaleUpdateId);
             this._scaleUpdateId = 0;
         }
+
+        if (this._monitorsUpdateId > 0) {
+            Mainloop.source_remove(this._monitorsUpdateId);
+            this._monitorsUpdateId = 0;
+        }
+
+        trayApplets.delete(this);
 
         this.signalManager.disconnectAllSignals();
 
